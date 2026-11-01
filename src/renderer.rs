@@ -7,8 +7,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tiny_skia::Pixmap;
-
 use crate::layout::LayoutEngine;
 use crate::types::Document;
 
@@ -31,7 +29,7 @@ impl Renderer {
         &mut self.layout
     }
 
-    pub fn render(&mut self, _doc: &mut Document, _pixmap: &mut Pixmap, _scale: f32) {
+    pub fn render<P>(&mut self, _doc: &mut Document, _pixmap: &mut P, _scale: f32) {
         static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::AcqRel) {
             eprintln!("osbrowser: the system browser paints its own window; there is no in-process frame to capture");

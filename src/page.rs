@@ -126,10 +126,18 @@ pub(crate) fn create(page: u64, operation: &str, args: Value) -> u32 {
 
 /// Upload raw RGBA bytes in the same ordered stream as DOM commands.
 pub(crate) fn write_pixels(page: u64, args: Value, pixels: Vec<u8>) {
-    if let Err(error) =
-        session().and_then(|session| session.enqueue_payload(page, "canvas_image", args, None, Some(pixels.into())))
-    {
+    if let Err(error) = session().and_then(|session| {
+        session.enqueue_payload(page, "canvas_image", args, None, Some(pixels.into()))?;
+        session.flush();
+        Ok(())
+    }) {
         report("canvas_image", &error);
+    }
+}
+
+pub(crate) fn flush() {
+    if let Ok(session) = session() {
+        session.flush();
     }
 }
 

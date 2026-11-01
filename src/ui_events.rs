@@ -62,10 +62,12 @@ pub fn push(event: UiEvent) {
 }
 
 pub fn poll() -> Option<UiEvent> {
+    crate::page::route();
     queue().lock().unwrap().events.pop_front()
 }
 
 pub fn pending() -> usize {
+    crate::page::route();
     queue().lock().unwrap().events.len()
 }
 

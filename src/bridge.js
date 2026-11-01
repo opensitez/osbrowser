@@ -457,6 +457,102 @@
       document.body.replaceChildren();
       return 'None';
     }
+    if (op === 'CreateElement') {
+      const tag = typeof a === 'string' ? a : (a?.tag || a?.[0] || 'div');
+      const el = docOf(docId).createElement(tag);
+      return { Node: idOf(el) };
+    }
+    if (op === 'SetAttribute') {
+      const [id, name, val] = a;
+      N(id)?.setAttribute?.(name, val);
+      return null;
+    }
+    if (op === 'AppendChild') {
+      const parent = a.parent ? N(a.parent) : (docOf(docId).body || docOf(docId).documentElement);
+      const child = N(a.child ?? a?.[1]);
+      if (parent && child) parent.appendChild(child);
+      return null;
+    }
+    if (op === 'SetTextContent') {
+      const [id, text] = a;
+      const el = N(id);
+      if (el) el.textContent = text;
+      return null;
+    }
+    if (op === 'QuerySelectorAll') {
+      const sel = typeof a === 'string' ? a : a[0];
+      const list = Array.from(docOf(docId).querySelectorAll(sel));
+      return { Nodes: list.map(idOf) };
+    }
+    if (op === 'BoundingClientRect') {
+      const id = typeof a === 'number' ? a : a[0];
+      const r = N(id)?.getBoundingClientRect?.() || { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
+      return { Rect: { x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, right: r.right, bottom: r.bottom, left: r.left } };
+    }
+    if (op === 'Title') {
+      return docOf(docId).title;
+    }
+    if (op === 'InnerHtml') {
+      const id = typeof a === 'number' ? a : a[0];
+      return { Text: N(id)?.innerHTML || '' };
+    }
+    if (op === 'OuterHtml') {
+      const id = typeof a === 'number' ? a : a[0];
+      return { Text: N(id)?.outerHTML || '' };
+    }
+    if (op === 'DispatchPointer') {
+      const el = docOf(docId).elementFromPoint(a.client_x, a.client_y) || docOf(docId).body;
+      if (el) el.dispatchEvent(new MouseEvent(a.kind || 'click', { bubbles: true, clientX: a.client_x, clientY: a.client_y, button: a.button || 0 }));
+      return null;
+    }
+    if (op === 'CanvasEnsure') {
+      const target = typeof a === 'string' ? a : (a?.target || '');
+      const id = parseInt(target.replace(/^n/, ''), 10);
+      const canvas = N(id);
+      if (canvas?.getContext) canvas.getContext('2d');
+      return true;
+    }
+    if (op === 'CanvasApply' || op === 'CanvasDrawImage') {
+      const target = typeof a === 'string' ? a : (a?.target || '');
+      const id = parseInt(target.replace(/^n/, ''), 10);
+      const canvas = N(id);
+      if (!canvas?.getContext) return null;
+      const ctx = canvas.getContext('2d');
+      const p = a.payload;
+      if (p) {
+        if ('SetImageSmoothing' in p) ctx.imageSmoothingEnabled = p.SetImageSmoothing;
+        if ('SetGlobalCompositeOperation' in p) ctx.globalCompositeOperation = p.SetGlobalCompositeOperation;
+        if ('SetFillStyleCss' in p) ctx.fillStyle = p.SetFillStyleCss;
+        if ('FillRect' in p) ctx.fillRect(...p.FillRect);
+        if ('PutImageData' in p) {
+          const pi = p.PutImageData;
+          const raw = a.pixels || (pi.pixels ? new Uint8ClampedArray(pi.pixels) : null);
+          if (raw && pi.width && pi.height) {
+            ctx.putImageData(new ImageData(raw, pi.width, pi.height), pi.dx || 0, pi.dy || 0);
+          }
+        }
+        if ('source' in p && 'rect' in p) {
+          const srcId = parseInt(p.source.replace(/^n/, ''), 10);
+          const srcCanvas = N(srcId);
+          if (srcCanvas) ctx.drawImage(srcCanvas, ...p.rect);
+        }
+      }
+      return null;
+    }
+    if (op === 'CanvasQuery') {
+      const target = typeof a === 'string' ? a : (a?.target || '');
+      const id = parseInt(target.replace(/^n/, ''), 10);
+      const canvas = N(id);
+      if (!canvas?.getContext) return null;
+      const ctx = canvas.getContext('2d');
+      const p = a.payload;
+      if (p?.GetImageData) {
+        const { sx, sy, sw, sh } = p.GetImageData;
+        const d = ctx.getImageData(sx, sy, sw, sh);
+        return { Pixels: { width: d.width, height: d.height, data: Array.from(d.data) } };
+      }
+      return null;
+    }
     throw new Error(`unsupported operation: ${op}`);
   }
 
@@ -487,11 +583,11 @@
             if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) ||
                 offset < 0 || size < 0 || offset + size > buffer.byteLength - start)
               throw new Error('invalid binary pixel range');
-            if (command.operation === 'canvas_image') {
+            if (command.operation === 'canvas_image' || command.operation === 'CanvasApply') {
               command.args.pixels = new Uint8ClampedArray(buffer, start + offset, size);
               continue;
             }
-            throw new Error('binary pixels are only carried by canvas_image');
+            throw new Error('binary pixels are only carried by canvas_image or CanvasApply');
           }
         } else {
           commands = await response.json();

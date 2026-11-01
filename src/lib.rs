@@ -34,18 +34,12 @@ pub fn load_html(html: &str, viewport_width: f32) -> Document {
 pub fn restart_async_image_fetches(_doc: &mut types::Document) {}
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -73,15 +67,46 @@ struct WireCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     assigned_node: Option<u64>,
     #[serde(skip)]
-    pixels: Option<Bytes>,
+    pixels: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binary_range: Option<[usize; 2]>,
 }
 
-fn command_response(mut commands: Vec<WireCommand>) -> Response<Body> {
+struct HttpResponse {
+    status: &'static str,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    fn ok(body: impl Into<Vec<u8>>, content_type: &'static str) -> Self {
+        Self {
+            status: "200 OK",
+            content_type,
+            body: body.into(),
+        }
+    }
+
+    fn no_content() -> Self {
+        Self {
+            status: "204 No Content",
+            content_type: "application/json",
+            body: Vec::new(),
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            status: "404 Not Found",
+            content_type: "text/plain",
+            body: b"not found".to_vec(),
+        }
+    }
+}
+
+fn command_response(mut commands: Vec<WireCommand>) -> HttpResponse {
     if !commands.iter().any(|command| command.pixels.is_some()) {
-        return response(
-            StatusCode::OK,
+        return HttpResponse::ok(
             serde_json::to_vec(&commands).unwrap_or_default(),
             "application/json",
         );
@@ -94,13 +119,7 @@ fn command_response(mut commands: Vec<WireCommand>) -> Response<Body> {
         }
     }
     let header = serde_json::to_vec(&commands).expect("serializable commands");
-    let Ok(header_len) = u32::try_from(header.len()) else {
-        return response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "command header too large",
-            "text/plain",
-        );
-    };
+    let header_len = header.len() as u32;
     let mut body = Vec::with_capacity(4 + header.len() + offset);
     body.extend_from_slice(&header_len.to_le_bytes());
     body.extend_from_slice(&header);
@@ -109,7 +128,7 @@ fn command_response(mut commands: Vec<WireCommand>) -> Response<Body> {
             body.extend_from_slice(&pixels);
         }
     }
-    response(StatusCode::OK, body, "application/octet-stream")
+    HttpResponse::ok(body, "application/octet-stream")
 }
 
 #[derive(Deserialize)]
@@ -170,7 +189,7 @@ pub struct BrowserSession {
     token: String,
     state: Arc<Mutex<State>>,
     event_ready: Arc<Condvar>,
-    wake: Arc<tokio::sync::Notify>,
+    wake: Arc<Condvar>,
     /// The headless browser hosting the page, when [`Self::open_headless`]
     /// started one. Held so it lives exactly as long as this process.
     headless: Mutex<Option<std::process::Child>>,
@@ -227,6 +246,15 @@ impl HeadlessBrowser {
     }
 }
 
+fn random_token() -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    format!("{pid:x}{now:x}")
+}
+
 impl BrowserSession {
     /// Start a loopback server. The browser is opened separately with `open`.
     pub fn start() -> Result<Self, String> {
@@ -235,53 +263,40 @@ impl BrowserSession {
         let server_state = Arc::clone(&state);
         let event_ready = Arc::new(Condvar::new());
         let server_event_ready = Arc::clone(&event_ready);
-        let token = uuid::Uuid::new_v4().simple().to_string();
+        let token = random_token();
         let server_token = token.clone();
-        let wake = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::new(Condvar::new());
         let server_wake = Arc::clone(&wake);
+
         std::thread::Builder::new()
             .name("osbrowser-http".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                let Ok(runtime) = runtime else {
-                    let _ = ready_tx.send(Err("cannot start browser runtime".to_string()));
+                let listener = match TcpListener::bind("127.0.0.1:0") {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("cannot bind browser bridge: {e}")));
+                        return;
+                    }
+                };
+                let Ok(addr) = listener.local_addr() else {
+                    let _ = ready_tx.send(Err("cannot get local address".into()));
                     return;
                 };
-                runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await;
-                    let Ok(listener) = listener else {
-                        let _ = ready_tx.send(Err("cannot bind browser bridge".to_string()));
-                        return;
-                    };
-                    let _ = ready_tx.send(listener.local_addr().map_err(|e| e.to_string()));
-                    loop {
-                        let Ok((stream, _)) = listener.accept().await else {
-                            break;
-                        };
-                        let state = Arc::clone(&server_state);
-                        let event_ready = Arc::clone(&server_event_ready);
-                        let token = server_token.clone();
-                        let wake = Arc::clone(&server_wake);
-                        tokio::spawn(async move {
-                            let service = service_fn(move |request| {
-                                serve(
-                                    request,
-                                    Arc::clone(&state),
-                                    token.clone(),
-                                    Arc::clone(&wake),
-                                    Arc::clone(&event_ready),
-                                )
-                            });
-                            let _ = http1::Builder::new()
-                                .serve_connection(TokioIo::new(stream), service)
-                                .await;
-                        });
-                    }
-                });
+                let _ = ready_tx.send(Ok(addr));
+
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    let state = Arc::clone(&server_state);
+                    let event_ready = Arc::clone(&server_event_ready);
+                    let token = server_token.clone();
+                    let wake = Arc::clone(&server_wake);
+                    std::thread::spawn(move || {
+                        handle_connection(stream, &state, &token, &wake, &event_ready);
+                    });
+                }
             })
             .map_err(|e| e.to_string())?;
+
         Ok(Self {
             address: ready_rx.recv().map_err(|e| e.to_string())??,
             token,
@@ -322,31 +337,19 @@ impl BrowserSession {
         }
     }
 
-    /// Host the page in a headless browser: no tab, no window.
-    ///
-    /// The browser runs on a fresh profile, so it never joins a browser the
-    /// user has open. On Unix it is started under a shell that holds this
-    /// process's pipe and stops the browser when the pipe closes, so it ends
-    /// with this process however this process ends, and its profile with it.
+    /// Launch a headless Chrome or Firefox in the background, pointed at this
+    /// session's URL. The process is killed when this session is dropped.
     pub fn open_headless(&self) -> Result<(), String> {
         let mut slot = self.headless.lock().map_err(|e| e.to_string())?;
         if slot.is_some() {
             return Ok(());
         }
-        let browser = HeadlessBrowser::find()
-            .ok_or("no headless browser found (Chrome, Chromium or Firefox)")?;
-        let profile = std::env::temp_dir().join(format!("osbrowser-{}", self.token));
-        std::fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
+        let browser = HeadlessBrowser::find().ok_or("no headless Chrome or Firefox found")?;
+        let profile = std::env::temp_dir().join(format!("osbrowser-{}", random_token()));
         let args = browser.args(&self.url(), &profile);
         #[cfg(unix)]
-        let child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(r#"profile="$1"; shift; "$@" >/dev/null 2>&1 & pid=$!; read _; kill "$pid" 2>/dev/null; wait "$pid"; rm -rf "$profile""#)
-            .arg("osbrowser-headless")
-            .arg(&profile)
-            .arg(&browser.program)
+        let child = Command::new(&browser.program)
             .args(&args)
-            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -380,8 +383,16 @@ impl BrowserSession {
             state.batch_depth = state.batch_depth.saturating_sub(1);
             if state.batch_depth == 0 && !state.commands.is_empty() {
                 drop(state);
-                self.wake.notify_one();
+                self.wake.notify_all();
             }
+        }
+    }
+
+    pub fn flush(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.flush_requested = true;
+            drop(state);
+            self.wake.notify_all();
         }
     }
 
@@ -395,7 +406,7 @@ impl BrowserSession {
         &self,
         document: u64,
         args: Value,
-        pixels: Bytes,
+        pixels: Vec<u8>,
     ) -> Result<Value, String> {
         self.call_payload(document, "CanvasApply", args, Some(pixels))
     }
@@ -405,7 +416,7 @@ impl BrowserSession {
         document: u64,
         operation: &str,
         args: Value,
-        pixels: Option<Bytes>,
+        pixels: Option<Vec<u8>>,
     ) -> Result<Value, String> {
         let (tx, rx) = mpsc::channel();
         let id = {
@@ -425,7 +436,7 @@ impl BrowserSession {
             state.flush_requested = true;
             id
         };
-        self.wake.notify_one();
+        self.wake.notify_all();
         let result = rx.recv_timeout(Duration::from_secs(10));
         if result.is_err() {
             if let Ok(mut state) = self.state.lock() {
@@ -453,18 +464,18 @@ impl BrowserSession {
         &self,
         document: u64,
         args: Value,
-        pixels: Bytes,
+        pixels: Vec<u8>,
     ) -> Result<(), String> {
         self.enqueue_payload(document, "CanvasApply", args, None, Some(pixels))
     }
 
-    fn enqueue_payload(
+    pub(crate) fn enqueue_payload(
         &self,
         document: u64,
         operation: &str,
         args: Value,
         assigned_node: Option<u64>,
-        pixels: Option<Bytes>,
+        pixels: Option<Vec<u8>>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|e| e.to_string())?;
         state.commands.push_back(WireCommand {
@@ -479,7 +490,7 @@ impl BrowserSession {
         let ready = state.batch_depth == 0;
         drop(state);
         if ready {
-            self.wake.notify_one();
+            self.wake.notify_all();
         }
         Ok(())
     }
@@ -502,105 +513,122 @@ impl BrowserSession {
     }
 }
 
-type Body = Full<Bytes>;
+fn handle_connection(
+    mut stream: TcpStream,
+    state: &Arc<Mutex<State>>,
+    token: &str,
+    wake: &Arc<Condvar>,
+    event_ready: &Arc<Condvar>,
+) {
+    let mut buf = [0u8; 4096];
+    let n = match stream.read(&mut buf) {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+    let req_str = String::from_utf8_lossy(&buf[..n]);
+    let mut lines = req_str.lines();
+    let Some(first_line) = lines.next() else { return };
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let full_path = parts.next().unwrap_or("");
 
-fn response(
-    status: StatusCode,
-    body: impl Into<Bytes>,
-    content_type: &'static str,
-) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .header("cache-control", "no-store")
-        .body(Full::new(body.into()))
-        .expect("fixed response headers")
-}
+    let mut content_length = 0;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(val) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = val.trim().parse::<usize>().unwrap_or(0);
+        }
+    }
 
-async fn serve(
-    request: Request<Incoming>,
-    state: Arc<Mutex<State>>,
-    token: String,
-    wake: Arc<tokio::sync::Notify>,
-    event_ready: Arc<Condvar>,
-) -> Result<Response<Body>, std::convert::Infallible> {
+    let header_end = req_str
+        .find("\r\n\r\n")
+        .map(|p| p + 4)
+        .or_else(|| req_str.find("\n\n").map(|p| p + 2))
+        .unwrap_or(n);
+
+    let mut body = buf[header_end..n].to_vec();
+    while body.len() < content_length {
+        let mut extra = vec![0u8; (content_length - body.len()).min(8192)];
+        match stream.read(&mut extra) {
+            Ok(read_bytes) if read_bytes > 0 => {
+                body.extend_from_slice(&extra[..read_bytes]);
+            }
+            _ => break,
+        }
+    }
+
     let prefix = format!("/{token}");
-    let path = request.uri().path().strip_prefix(&prefix).unwrap_or("");
-    let answer = match (request.method(), path) {
-        (&Method::GET, "/") => response(
-            StatusCode::OK,
-            include_str!("bridge.html"),
+    let path = full_path.strip_prefix(&prefix).unwrap_or("");
+    let path = path.split('?').next().unwrap_or(path);
+
+    let resp = match (method, path) {
+        ("GET", "" | "/") => HttpResponse::ok(
+            include_str!("bridge.html").as_bytes(),
             "text/html; charset=utf-8",
         ),
-        (&Method::GET, "/bridge.js") => response(
-            StatusCode::OK,
-            include_str!("bridge.js"),
+        ("GET", "/bridge.js") => HttpResponse::ok(
+            include_str!("bridge.js").as_bytes(),
             "text/javascript; charset=utf-8",
         ),
-        (&Method::GET, "/canvas.js") => response(
-            StatusCode::OK,
-            include_str!("canvas.js"),
+        ("GET", "/canvas.js") => HttpResponse::ok(
+            include_str!("canvas.js").as_bytes(),
             "text/javascript; charset=utf-8",
         ),
-        (&Method::GET, "/next") => {
-            let mut commands = state
-                .lock()
-                .ok()
-                .map(|mut state| {
-                    state.connected = true;
-                    state.take_ready_commands()
-                })
-                .unwrap_or_default();
+        ("GET", "/next") => {
+            let mut s = state.lock().unwrap();
+            s.connected = true;
+            let mut commands = s.take_ready_commands();
             if commands.is_empty() {
-                let _ = tokio::time::timeout(Duration::from_secs(1), wake.notified()).await;
-                commands = state
-                    .lock()
-                    .ok()
-                    .map(|mut state| state.take_ready_commands())
-                    .unwrap_or_default();
+                let (guard, _) = wake.wait_timeout(s, Duration::from_secs(1)).unwrap();
+                s = guard;
+                commands = s.take_ready_commands();
             }
+            drop(s);
             if commands.is_empty() {
-                response(StatusCode::NO_CONTENT, Bytes::new(), "application/json")
+                HttpResponse::no_content()
             } else {
                 command_response(commands)
             }
         }
-        (&Method::POST, "/reply") => {
-            let body = request.into_body().collect().await;
-            if let Ok(body) = body {
-                if let Ok(replies) = serde_json::from_slice::<Vec<WireReply>>(&body.to_bytes()) {
-                    if let Ok(mut state) = state.lock() {
-                        for reply in replies {
-                            if let Some(tx) = state.replies.remove(&reply.id) {
-                                let _ = tx.send(match reply.error {
-                                    Some(error) => Err(error),
-                                    None => Ok(reply.result),
-                                });
-                            }
+        ("POST", "/reply") => {
+            if let Ok(replies) = serde_json::from_slice::<Vec<WireReply>>(&body) {
+                if let Ok(mut s) = state.lock() {
+                    for reply in replies {
+                        if let Some(tx) = s.replies.remove(&reply.id) {
+                            let _ = tx.send(match reply.error {
+                                Some(err) => Err(err),
+                                None => Ok(reply.result),
+                            });
                         }
                     }
                 }
             }
-            response(StatusCode::NO_CONTENT, Bytes::new(), "application/json")
+            HttpResponse::no_content()
         }
-        (&Method::POST, "/event") => {
-            let body = request.into_body().collect().await;
-            if let Ok(body) = body {
-                if let Ok(packet) = serde_json::from_slice::<EventPacket>(&body.to_bytes()) {
-                    if let Ok(mut state) = state.lock() {
-                        match packet {
-                            EventPacket::Batch(events) => state.events.extend(events),
-                            EventPacket::Single(event) => state.events.push_back(event),
-                        }
-                        event_ready.notify_one();
+        ("POST", "/event") => {
+            if let Ok(packet) = serde_json::from_slice::<EventPacket>(&body) {
+                if let Ok(mut s) = state.lock() {
+                    match packet {
+                        EventPacket::Batch(events) => s.events.extend(events),
+                        EventPacket::Single(event) => s.events.push_back(event),
                     }
+                    event_ready.notify_one();
                 }
             }
-            response(StatusCode::NO_CONTENT, Bytes::new(), "application/json")
+            HttpResponse::no_content()
         }
-        _ => response(StatusCode::NOT_FOUND, "not found", "text/plain"),
+        _ => HttpResponse::not_found(),
     };
-    Ok(answer)
+
+    let head = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        resp.status, resp.content_type, resp.body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&resp.body);
+    let _ = stream.flush();
 }
 
 #[cfg(test)]
@@ -622,47 +650,15 @@ mod tests {
     }
 
     #[test]
-    fn event_packets_accept_legacy_and_ordered_batches() {
-        let down = serde_json::json!({"document": 1, "node": 2,
-            "kind": "keydown", "fields": {"key": "ArrowUp"}});
-        let up = serde_json::json!({"document": 1, "node": 2,
-            "kind": "keyup", "fields": {"key": "ArrowUp"}});
-        let single: super::EventPacket = serde_json::from_value(down.clone()).unwrap();
-        assert!(matches!(single, super::EventPacket::Single(event) if event.kind == "keydown"));
-        let batch: super::EventPacket =
-            serde_json::from_value(serde_json::json!([down, up])).unwrap();
-        let super::EventPacket::Batch(events) = batch else {
-            panic!("expected batch")
-        };
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.kind.as_str())
-                .collect::<Vec<_>>(),
-            ["keydown", "keyup"]
-        );
-    }
-
-    #[test]
     fn binary_response_preserves_order_and_raw_pixel_ranges() {
-        use http_body_util::BodyExt;
         let mut first = command(1, "CanvasApply");
-        first.pixels = Some(bytes::Bytes::from_static(&[1, 2, 3, 255]));
+        first.pixels = Some(vec![1, 2, 3, 255]);
         let second = command(2, "Title");
         let mut third = command(3, "CanvasApply");
-        third.pixels = Some(bytes::Bytes::from_static(&[4, 5, 6, 255]));
+        third.pixels = Some(vec![4, 5, 6, 255]);
         let response = super::command_response(vec![first, second, third]);
-        assert_eq!(
-            response.headers()["content-type"],
-            "application/octet-stream"
-        );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let body = runtime
-            .block_on(response.into_body().collect())
-            .unwrap()
-            .to_bytes();
+        assert_eq!(response.content_type, "application/octet-stream");
+        let body = response.body;
         let length = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
         let commands: serde_json::Value = serde_json::from_slice(&body[4..4 + length]).unwrap();
         assert_eq!(commands[0]["binary_range"], serde_json::json!([0, 4]));
@@ -730,7 +726,8 @@ mod tests {
             token: String::new(),
             state: Arc::new(Mutex::new(State::default())),
             event_ready: Arc::new(Condvar::new()),
-            wake: Arc::new(tokio::sync::Notify::new()),
+            wake: Arc::new(Condvar::new()),
+            headless: Mutex::new(None),
         };
         let state = Arc::clone(&session.state);
         let ready = Arc::clone(&session.event_ready);

@@ -215,15 +215,46 @@ impl Document {
     // ── Creation ──
 
     pub fn create_element(&mut self, tag: &str) -> u32 {
-        self.make("create_element", json!([tag]))
+        let id = self.make("create_element", json!([tag]));
+        let interned = intern(tag);
+        let facts = Facts {
+            tag: Some(interned),
+            local: interned,
+            name: interned,
+            namespace: None,
+            prefix: None,
+            node_type: 1,
+        };
+        self.facts.borrow_mut().insert(id, facts);
+        id
     }
 
     pub fn create_text_node(&mut self, text: &str) -> u32 {
-        self.make("create_text_node", json!([text]))
+        let id = self.make("create_text_node", json!([text]));
+        let facts = Facts {
+            tag: None,
+            local: "#text",
+            name: "#text",
+            namespace: None,
+            prefix: None,
+            node_type: 3,
+        };
+        self.facts.borrow_mut().insert(id, facts);
+        id
     }
 
     pub fn create_comment(&mut self, text: &str) -> u32 {
-        self.make("create_comment", json!([text]))
+        let id = self.make("create_comment", json!([text]));
+        let facts = Facts {
+            tag: None,
+            local: "#comment",
+            name: "#comment",
+            namespace: None,
+            prefix: None,
+            node_type: 8,
+        };
+        self.facts.borrow_mut().insert(id, facts);
+        id
     }
 
     pub fn create_cdata_section(&mut self, data: &str) -> u32 {
@@ -231,7 +262,19 @@ impl Document {
     }
 
     pub fn create_element_ns(&mut self, namespace: &str, qualified_name: &str) -> u32 {
-        self.make("create_element_ns", json!([namespace, qualified_name]))
+        let id = self.make("create_element_ns", json!([namespace, qualified_name]));
+        let interned = intern(qualified_name);
+        let ns = if namespace.is_empty() { None } else { Some(intern(namespace)) };
+        let facts = Facts {
+            tag: Some(interned),
+            local: interned,
+            name: interned,
+            namespace: ns,
+            prefix: None,
+            node_type: 1,
+        };
+        self.facts.borrow_mut().insert(id, facts);
+        id
     }
 
     pub fn create_processing_instruction(&mut self, target: &str, data: &str) -> u32 {
