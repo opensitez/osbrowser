@@ -1,5 +1,8 @@
 # osbrowser
 
+**osbrowser** is a lightweight api wrapping whatwg browsers like chrome to use it as a gui designed to expose the same API as the rust webcore crate, ie you can use osbrowser and **webcore** interchangeably. Use this crate for smaller executable, use **webcore** for an in process custom **web engine** written in **rust**  
+
+
 [webcore](https://crates.io/crates/webcore)'s API, with the system browser doing the rendering.
 
 `osbrowser` exposes the same modules, types and signatures as webcore:
@@ -75,6 +78,16 @@ Run the full example with `cargo run --example counter`.
 - A listener can't cancel the browser's own default action for a real user
   event. By the time the event reaches this process, the browser has already
   acted on it.
+
+## Demos
+![Calculator](images/calculator.png)
+cargo run --example calculator
+
+![Platform](images/platform.png)
+cargo run --example calculator
+
+![Canvas](images/canvas.png)
+cargo run --example canvas
 
 ## License
 
