@@ -16,8 +16,11 @@ fn main() -> Result<(), String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         let chrome = "google-chrome";
         let path = std::env::temp_dir().join(format!(
-            "osbrowser-smoke-{}",
-            uuid::Uuid::new_v4().simple()
+            "osbrowser-smoke-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
         ));
         let child = std::process::Command::new(chrome)
             .arg("--headless=new")

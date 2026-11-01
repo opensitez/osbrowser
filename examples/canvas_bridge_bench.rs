@@ -1,5 +1,4 @@
 //! Measure the browser transport directly, without the compiler or WASM VM.
-use bytes::Bytes;
 use osbrowser::BrowserSession;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -75,7 +74,7 @@ fn run(
         if !binary {
             image["payload"]["PutImageData"]["pixels"] = json!(pixels);
         }
-        raw_images.push(Bytes::from(pixels));
+        raw_images.push(pixels);
         images.push(image);
     }
     let copies = [
@@ -269,8 +268,11 @@ fn main() -> Result<(), String> {
         #[cfg(all(unix, not(target_os = "macos")))]
         let chrome = "google-chrome";
         let path = std::env::temp_dir().join(format!(
-            "canvas-bridge-bench-{}",
-            uuid::Uuid::new_v4().simple()
+            "canvas-bridge-bench-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
         ));
         child = Some(
             std::process::Command::new(chrome)
